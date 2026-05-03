@@ -1,12 +1,14 @@
+
+//! HTTP/REST transport using ureq (sync, rustls, no OpenSSL).
+
+use anyhow::{Context, Result};
 use crate::config::Profile;
-use anyhow::Result;
-use reqwest::Client;
 
 pub struct HttpClient {
     pub base_url: String,
     pub user: String,
     pub password: Option<String>,
-    client: Client,
+    agent: ureq::Agent,
 }
 
 impl HttpClient {
@@ -15,42 +17,70 @@ impl HttpClient {
             base_url: profile.http_base(),
             user: profile.user.clone(),
             password: profile.password.clone(),
-            client: Client::builder()
-                .use_rustls_tls()
-                .build()
-                .expect("Failed to build HTTP client"),
+            agent: ureq::AgentBuilder::new()
+                .redirects(3)
+                .build(),
         }
     }
 
-    pub fn get(&self, path: &str) -> reqwest::RequestBuilder {
-        let url = format!("{}{}", self.base_url, path);
-        let mut req = self.client.get(&url);
-        if let Some(pass) = &self.password {
-            req = req.basic_auth(&self.user, Some(pass));
-        } else {
-            req = req.basic_auth(&self.user, None::<&str>);
-        }
-        req
+    fn url(&self, path: &str) -> String {
+        format!("{}{}", self.base_url, path)
     }
 
-    pub fn put(&self, path: &str) -> reqwest::RequestBuilder {
-        let url = format!("{}{}", self.base_url, path);
-        let mut req = self.client.put(&url);
-        if let Some(pass) = &self.password {
-            req = req.basic_auth(&self.user, Some(pass));
-        } else {
-            req = req.basic_auth(&self.user, None::<&str>);
-        }
-        req
+    fn auth(&self, req: ureq::Request) -> ureq::Request {
+        req.set(
+            "Authorization",
+            &basic_auth(&self.user, self.password.as_deref().unwrap_or("")),
+        )
     }
 
-    pub async fn get_json(&self, path: &str) -> Result<serde_json::Value> {
-        let resp = self.get(path).send().await?;
-        let status = resp.status();
-        let body: serde_json::Value = resp.json().await?;
-        if !status.is_success() {
-            anyhow::bail!("HTTP {} from {}: {}", status, path, body);
-        }
-        Ok(body)
+    pub fn get_json(&self, path: &str) -> Result<serde_json::Value> {
+        tracing::debug!("http GET {}", path);
+        let resp = self
+            .auth(self.agent.get(&self.url(path)))
+            .call()
+            .with_context(|| format!("GET {} failed", path))?;
+        Ok(resp.into_json()?)
     }
+
+    pub fn put_bytes(
+        &self,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: Vec<u8>,
+    ) -> Result<serde_json::Value> {
+        tracing::debug!("http PUT {} ({} bytes)", path, body.len());
+        let mut req = self.auth(self.agent.put(&self.url(path)));
+        for (k, v) in headers {
+            req = req.set(k, v);
+        }
+        let resp = req
+            .send_bytes(&body)
+            .with_context(|| format!("PUT {} failed", path))?;
+        Ok(resp.into_json()?)
+    }
+}
+
+fn basic_auth(user: &str, pass: &str) -> String {
+    use std::io::Write;
+    let encoded = {
+        let input = format!("{}:{}", user, pass);
+        base64_encode(input.as_bytes())
+    };
+    format!("Basic {}", encoded)
+}
+
+fn base64_encode(input: &[u8]) -> String {
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as usize;
+        let b1 = if chunk.len() > 1 { chunk[1] as usize } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as usize } else { 0 };
+        out.push(CHARS[(b0 >> 2)] as char);
+        out.push(CHARS[((b0 & 3) << 4) | (b1 >> 4)] as char);
+        if chunk.len() > 1 { out.push(CHARS[((b1 & 15) << 2) | (b2 >> 6)] as char); } else { out.push('='); }
+        if chunk.len() > 2 { out.push(CHARS[b2 & 63] as char); } else { out.push('='); }
+    }
+    out
 }

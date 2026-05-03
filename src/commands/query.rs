@@ -1,6 +1,6 @@
-use anyhow::Result;
+
+use anyhow::{bail, Result};
 use clap::Args;
-use sqlx::Row;
 use crate::output::{Format, ResultSet};
 use crate::transport::Connection;
 
@@ -8,53 +8,61 @@ use crate::transport::Connection;
 pub struct QueryArgs {
     /// SQL query string
     pub sql: Option<String>,
-    /// Read query from file
-    #[arg(short = 'f', long)]
+    /// Read query from a file
+    #[arg(short = 'f', long, value_name = "FILE")]
     pub file: Option<String>,
-    /// Database to use
+    /// Database to USE before running the query
     #[arg(short, long)]
     pub database: Option<String>,
+    /// Preview the query without executing (print SQL only)
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 pub async fn run(args: QueryArgs, conn: &Connection, format: Format) -> Result<()> {
-    let sql = if let Some(f) = args.file {
-        std::fs::read_to_string(&f)
-            .map_err(|e| anyhow::anyhow!("Failed to read file '{}': {}", f, e))?
-    } else if let Some(s) = args.sql {
-        s
-    } else {
-        anyhow::bail!("Provide a SQL string or --file <path>");
-    };
-
-    let pool = conn.mysql().await?;
+    let sql = resolve_sql(args.sql, args.file)?;
 
     // Switch database if requested
     if let Some(db) = &args.database {
-        sqlx::query(&format!("USE `{}`", db)).execute(&pool).await?;
+        conn.use_db(db)?;
     } else if let Some(db) = &conn.profile.database {
-        sqlx::query(&format!("USE `{}`", db)).execute(&pool).await?;
+        conn.use_db(db)?;
     }
 
-    // Execute and collect results
-    let rows = sqlx::query(&sql).fetch_all(&pool).await
-        .map_err(|e| anyhow::anyhow!("Query error: {}", e))?;
-
-    if rows.is_empty() {
-        println!("(no rows)");
+    if args.dry_run {
+        println!("-- dry-run (not executed) --");
+        println!("{}", sql);
         return Ok(());
     }
 
-    let columns: Vec<String> = rows[0].columns().iter().map(|c| c.name().to_string()).collect();
-    let data: Vec<Vec<String>> = rows.iter().map(|row| {
-        (0..columns.len()).map(|i| {
-            row.try_get::<String, _>(i)
-                .or_else(|_| row.try_get::<i64, _>(i).map(|v| v.to_string()))
-                .or_else(|_| row.try_get::<f64, _>(i).map(|v| v.to_string()))
-                .or_else(|_| row.try_get::<bool, _>(i).map(|v| v.to_string()))
-                .unwrap_or_else(|_| "NULL".to_string())
-        }).collect()
-    }).collect();
+    // Detect whether this is a read (SELECT/SHOW/DESCRIBE/EXPLAIN) or write
+    let trimmed = sql.trim_start().to_ascii_uppercase();
+    let is_read = trimmed.starts_with("SELECT")
+        || trimmed.starts_with("SHOW")
+        || trimmed.starts_with("DESCRIBE")
+        || trimmed.starts_with("DESC")
+        || trimmed.starts_with("EXPLAIN")
+        || trimmed.starts_with("WITH");
 
-    ResultSet::new(columns, data).print(format)?;
+    if is_read {
+        let result = conn.query(&sql)?;
+        ResultSet::new(result.columns, result.rows).print(format)?;
+    } else {
+        let affected = conn.execute(&sql)?;
+        println!("OK — {} row(s) affected.", affected);
+    }
+
     Ok(())
+}
+
+pub fn resolve_sql(sql: Option<String>, file: Option<String>) -> Result<String> {
+    match (sql, file) {
+        (Some(s), None) => Ok(s),
+        (None, Some(f)) => {
+            Ok(std::fs::read_to_string(&f)
+                .map_err(|e| anyhow::anyhow!("Cannot read '{}': {}", f, e))?)
+        }
+        (Some(_), Some(_)) => bail!("Provide either a SQL string or --file, not both."),
+        (None, None) => bail!("Provide a SQL string or --file <path>."),
+    }
 }
