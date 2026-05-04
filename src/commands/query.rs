@@ -1,4 +1,3 @@
-
 use anyhow::{bail, Result};
 use clap::Args;
 use colored::Colorize;
@@ -24,7 +23,6 @@ pub struct QueryArgs {
 }
 
 pub async fn run(args: QueryArgs, conn: &Connection, format: Format) -> Result<()> {
-    // Switch database if requested
     if let Some(db) = &args.database {
         conn.use_db(db)?;
     } else if let Some(db) = &conn.profile.database {
@@ -32,9 +30,7 @@ pub async fn run(args: QueryArgs, conn: &Connection, format: Format) -> Result<(
     }
 
     match (args.sql, args.file) {
-        // Interactive mode — no SQL provided
         (None, None) => run_repl(conn, format),
-        // One-shot mode
         (sql, file) => {
             let sql = resolve_sql(sql, file)?;
             if args.dry_run {
@@ -47,12 +43,10 @@ pub async fn run(args: QueryArgs, conn: &Connection, format: Format) -> Result<(
     }
 }
 
-/// Interactive REPL — accumulates multi-line input until a `;` is found.
 fn run_repl(conn: &Connection, format: Format) -> Result<()> {
     let history_path = dirs::data_local_dir()
         .map(|d| d.join("dorisctl").join("history"))
         .unwrap_or_else(|| std::path::PathBuf::from(".dorisctl_history"));
-
     if let Some(parent) = history_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -73,16 +67,28 @@ fn run_repl(conn: &Connection, format: Format) -> Result<()> {
         format!("connected to {}", conn.profile.fe_host).dimmed()
     );
     println!(
-        "  Type SQL and end with {} to execute.  {} to quit.\n",
-        ";".yellow(),
-        "\\q or Ctrl-D".yellow()
+        "  Type SQL ending with {}  |  {} for help  |  {} or Ctrl-D to quit\n",
+        ";".yellow(), "\\?".yellow(), "\\q".yellow()
     );
 
+    // Track current catalog so prompt can show context
+    let mut current_catalog: Option<String> = None;
+    let mut current_db: Option<String> = None;
     let mut buf = String::new();
 
     loop {
+        // Build prompt showing catalog.db context
+        let ctx = match (&current_catalog, &current_db) {
+            (Some(cat), Some(db)) => format!("[{}.{}]", cat, db),
+            (Some(cat), None)     => format!("[{}]", cat),
+            _                     => String::new(),
+        };
         let prompt = if buf.trim().is_empty() {
-            format!("{} ", "doris>".cyan().bold())
+            if ctx.is_empty() {
+                format!("{} ", "doris>".cyan().bold())
+            } else {
+                format!("{}{} ", "doris".cyan().bold(), ctx.dimmed())
+            }
         } else {
             format!("{} ", "     >".dimmed())
         };
@@ -91,68 +97,163 @@ fn run_repl(conn: &Connection, format: Format) -> Result<()> {
             Ok(line) => {
                 let trimmed = line.trim();
 
-                // Exit commands
-                if buf.trim().is_empty() {
-                    if trimmed == "\\q" || trimmed == "quit" || trimmed == "exit" {
+                // ── Meta-commands ─────────────────────────────────────────────
+
+                // Quit
+                if trimmed == "\\q" || trimmed == "quit" || trimmed == "exit" {
+                    if buf.trim().is_empty() {
                         println!("Bye!");
                         break;
                     }
-                    // Meta-commands
-                    if trimmed == "\\?" || trimmed == "\\help" {
-                        print_help();
-                        continue;
-                    }
-                    if trimmed.starts_with("\\c ") {
-                        let db = trimmed[3..].trim();
-                        match conn.use_db(db) {
-                            Ok(_) => println!("You are now connected to database \"{}\".", db),
-                            Err(e) => eprintln!("{} {}", "error:".red(), e),
+                    println!("{}", "-- buffer cleared --".dimmed());
+                    buf.clear();
+                    continue;
+                }
+
+                // Help
+                if trimmed == "\\?" || trimmed == "\\help" {
+                    print_help();
+                    continue;
+                }
+
+                // \l — list catalogs
+                if trimmed == "\\l" {
+                    exec_or_print_err(conn, "SHOW CATALOGS", format);
+                    continue;
+                }
+
+                // \ldb — list databases in current catalog context
+                if trimmed == "\\ldb" {
+                    let sql = if let Some(cat) = &current_catalog {
+                        format!("SHOW DATABASES FROM {}", cat)
+                    } else {
+                        "SHOW DATABASES".to_string()
+                    };
+                    exec_or_print_err(conn, &sql, format);
+                    continue;
+                }
+
+                // \c catalog  — switch catalog (Doris: SWITCH `catalog`)
+                // \c catalog.db — switch catalog then track db (no USE for external catalogs)
+                if trimmed.starts_with("\\c ") {
+                    let target = trimmed[3..].trim();
+                    let parts: Vec<&str> = target.splitn(2, '.').collect();
+                    let catalog = parts[0];
+                    let db = parts.get(1).copied();
+
+                    match exec_silent(conn, &format!("SWITCH `{}`", catalog)) {
+                        Ok(_) => {
+                            current_catalog = Some(catalog.to_string());
+                            // Don't USE for external catalogs — just track db locally
+                            current_db = db.map(|d| d.to_string());
+                            match &current_db {
+                                Some(d) => println!("Switched to \"{}.{}\".", catalog, d),
+                                None    => println!("Switched to catalog \"{}\".", catalog),
+                            }
                         }
-                        continue;
+                        Err(e) => eprintln!("{} {}", "error:".red(), e),
                     }
-                    if trimmed == "\\l" {
-                        let _ = exec_sql(conn, "SHOW DATABASES", format);
-                        continue;
-                    }
-                    if trimmed == "\\dt" || trimmed == "\\d" {
-                        let _ = exec_sql(conn, "SHOW TABLES", format);
-                        continue;
-                    }
-                    if trimmed.starts_with("\\d ") {
-                        let table = trimmed[3..].trim();
-                        let _ = exec_sql(conn, &format!("DESCRIBE `{}`", table), format);
-                        continue;
-                    }
+                    continue;
                 }
 
+                // \dt           — list tables; needs catalog.db context
+                // \dt db        — list tables in catalog.db (uses current catalog)
+                // \dt cat.db    — fully explicit
+                if trimmed == "\\dt" || trimmed.starts_with("\\dt ") {
+                    let arg = if trimmed.len() > 4 { trimmed[4..].trim() } else { "" };
+                    let sql = if !arg.is_empty() {
+                        // explicit arg: if it contains a dot, use as-is; else prepend current catalog
+                        if arg.contains('.') {
+                            format!("SHOW TABLES FROM {}", arg)
+                        } else if let Some(cat) = &current_catalog {
+                            format!("SHOW TABLES FROM {}.{}", cat, arg)
+                        } else {
+                            format!("SHOW TABLES FROM {}", arg)
+                        }
+                    } else {
+                        // no arg: need catalog.db — use tracked values
+                        match (&current_catalog, &current_db) {
+                            (Some(cat), Some(db)) => format!("SHOW TABLES FROM {}.{}", cat, db),
+                            (Some(cat), None) => {
+                                eprintln!("{} no database selected — use {}  or  {}", 
+                                    "hint:".yellow(), "\\dt <db>".yellow(), "\\c catalog.db".yellow());
+                                format!("SHOW DATABASES") // fallback: show available dbs
+                            }
+                            _ => "SHOW TABLES".to_string(),
+                        }
+                    };
+                    exec_or_print_err(conn, &sql, format);
+                    continue;
+                }
+
+                // \d            — show tables in current context
+                // \d name       — describe table (table / db.table / cat.db.table)
+                if trimmed == "\\d" {
+                    let sql = match (&current_catalog, &current_db) {
+                        (Some(cat), Some(db)) => format!("SHOW TABLES FROM {}.{}", cat, db),
+                        _ => "SHOW TABLES".to_string(),
+                    };
+                    exec_or_print_err(conn, &sql, format);
+                    continue;
+                }
+                if trimmed.starts_with("\\d ") {
+                    let arg = trimmed[3..].trim();
+                    let part_count = arg.split('.').count();
+                    // Doris external catalogs require fully-qualified catalog.db.table.
+                    // Auto-prepend missing parts from tracked context.
+                    let full = match part_count {
+                        1 => match (&current_catalog, &current_db) {
+                            (Some(cat), Some(db)) => format!("{}.{}.{}", cat, db, arg),
+                            (Some(cat), None) => {
+                                eprintln!("{} no database in context — use \\d cat.db.table", "hint:".yellow());
+                                format!("{}.{}", cat, arg)
+                            }
+                            _ => arg.to_string(),
+                        },
+                        2 => match &current_catalog {
+                            Some(cat) => format!("{}.{}", cat, arg),
+                            None => arg.to_string(),
+                        },
+                        _ => arg.to_string(), // 3 parts: already fully qualified
+                    };
+                    let qualified = full.split('.')
+                        .map(|p| format!("`{}`", p))
+                        .collect::<Vec<_>>()
+                        .join(".");
+                    exec_or_print_err(conn, &format!("DESCRIBE {}", qualified), format);
+                    continue;
+                }
+
+                // ── SQL buffer accumulation ───────────────────────────────────
                 rl.add_history_entry(line.as_str())?;
-
-                if !buf.is_empty() {
-                    buf.push('\n');
-                }
+                if !buf.is_empty() { buf.push('\n'); }
                 buf.push_str(&line);
 
-                // Execute when we see a semicolon at end of trimmed buffer
                 if buf.trim_end().ends_with(';') {
                     let sql = buf.trim().trim_end_matches(';').trim().to_string();
                     buf.clear();
+                    if sql.is_empty() { continue; }
 
-                    if sql.is_empty() {
-                        continue;
+                    // Track SWITCH / USE issued as raw SQL
+                    let up = sql.trim_start().to_ascii_uppercase();
+                    if up.starts_with("SWITCH ") {
+                        let cat = sql[7..].trim().trim_matches('`').to_string();
+                        current_catalog = Some(cat);
+                        current_db = None;
+                    } else if up.starts_with("USE ") {
+                        let db = sql[4..].trim().trim_matches('`').to_string();
+                        current_db = Some(db);
                     }
 
                     let start = std::time::Instant::now();
                     match exec_sql(conn, &sql, format) {
-                        Ok(_) => {
-                            println!("{}", format!("Time: {:.3}s", start.elapsed().as_secs_f64()).dimmed());
-                        }
+                        Ok(_) => println!("{}", format!("Time: {:.3}s", start.elapsed().as_secs_f64()).dimmed()),
                         Err(e) => eprintln!("{} {}", "error:".red(), e),
                     }
                 }
             }
 
             Err(ReadlineError::Interrupted) => {
-                // Ctrl-C clears current buffer like psql
                 if !buf.trim().is_empty() {
                     println!("{}", "-- cancelled --".dimmed());
                     buf.clear();
@@ -160,16 +261,8 @@ fn run_repl(conn: &Connection, format: Format) -> Result<()> {
                     println!("(Use \\q to quit)");
                 }
             }
-
-            Err(ReadlineError::Eof) => {
-                println!("\nBye!");
-                break;
-            }
-
-            Err(e) => {
-                eprintln!("{} {}", "readline error:".red(), e);
-                break;
-            }
+            Err(ReadlineError::Eof) => { println!("\nBye!"); break; }
+            Err(e) => { eprintln!("{} {}", "readline error:".red(), e); break; }
         }
     }
 
@@ -177,29 +270,48 @@ fn run_repl(conn: &Connection, format: Format) -> Result<()> {
     Ok(())
 }
 
+/// Run SQL, print error if it fails (for meta-commands where we don't want to propagate)
+fn exec_or_print_err(conn: &Connection, sql: &str, format: Format) {
+    if let Err(e) = exec_sql(conn, sql, format) {
+        eprintln!("{} {}", "error:".red(), e);
+    }
+}
+
+/// Run SQL silently (no output), return result (for \c switching)
+fn exec_silent(conn: &Connection, sql: &str) -> Result<()> {
+    let up = sql.trim_start().to_ascii_uppercase();
+    let is_read = up.starts_with("SELECT") || up.starts_with("SHOW")
+        || up.starts_with("DESCRIBE") || up.starts_with("DESC")
+        || up.starts_with("EXPLAIN") || up.starts_with("WITH");
+    if is_read {
+        conn.query(sql)?;
+    } else {
+        conn.execute(sql)?;
+    }
+    Ok(())
+}
+
 fn print_help() {
     println!();
-    println!("  {}  exit the REPL", "\\q / exit / quit".yellow());
-    println!("  {}        list databases", "\\l".yellow());
-    println!("  {}        list tables in current database", "\\dt".yellow());
-    println!("  {}  <table>  describe a table", "\\d".yellow());
-    println!("  {}  <db>     switch database", "\\c".yellow());
-    println!("  {}       show this help", "\\?".yellow());
-    println!("  End any SQL with {} to execute", ";".yellow());
-    println!("  Multi-line input is supported — press Enter to continue");
-    println!("  Arrow keys / history: Up/Down navigate previous queries");
+    println!("  {}       exit", "\\q / exit / quit".yellow());
+    println!("  {}            list catalogs", "\\l".yellow());
+    println!("  {}           list databases in current catalog", "\\ldb".yellow());
+    println!("  {}  [db]       list tables (current db or given db)", "\\dt".yellow());
+    println!("  {}  [cat.db]   list tables with explicit catalog.db", "\\dt".yellow());
+    println!("  {}  <name>     describe  (table / db.table / cat.db.table)", "\\d".yellow());
+    println!("  {}  <cat[.db]> switch catalog, optionally set db too", "\\c".yellow());
+    println!("  {}          this help", "\\?".yellow());
+    println!();
+    println!("  End SQL with {} to execute.  Multi-line supported.", ";".yellow());
+    println!("  Ctrl-C cancels buffer.  Up/Down for history.");
     println!();
 }
 
 fn exec_sql(conn: &Connection, sql: &str, format: Format) -> Result<()> {
-    let trimmed = sql.trim_start().to_ascii_uppercase();
-    let is_read = trimmed.starts_with("SELECT")
-        || trimmed.starts_with("SHOW")
-        || trimmed.starts_with("DESCRIBE")
-        || trimmed.starts_with("DESC")
-        || trimmed.starts_with("EXPLAIN")
-        || trimmed.starts_with("WITH");
-
+    let up = sql.trim_start().to_ascii_uppercase();
+    let is_read = up.starts_with("SELECT") || up.starts_with("SHOW")
+        || up.starts_with("DESCRIBE") || up.starts_with("DESC")
+        || up.starts_with("EXPLAIN") || up.starts_with("WITH");
     if is_read {
         let result = conn.query(sql)?;
         ResultSet::new(result.columns, result.rows).print(format)?;
