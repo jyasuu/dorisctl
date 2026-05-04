@@ -38,7 +38,7 @@ pub enum PostgresCmd {
     /// Compare Doris table schema with a Postgres DDL file
     Compare {
         table: String,
-        #[arg(short = 'f', long, value_name = "FILE")]
+        #[arg(long, value_name = "FILE")]
         file: String,
         #[arg(short, long)]
         db: Option<String>,

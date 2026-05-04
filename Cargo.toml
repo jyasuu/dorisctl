@@ -9,7 +9,7 @@ name = "dorisctl"
 path = "src/main.rs"
 
 [dependencies]
-clap = { version = "=4.4.18", features = ["derive"] }
+clap = { version = "=4.4.18", features = ["derive", "env"] }
 tokio = { version = "=1.36.0", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -22,3 +22,6 @@ anyhow = "1"
 dirs = "=5.0.1"
 colored = "=2.1.0"
 csv = "=1.3.0"
+dialoguer = "=0.11.0"
+similar = "=2.5.0"
+tracing = "=0.1.40"

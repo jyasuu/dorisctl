@@ -23,7 +23,7 @@ pub enum SchemaCmd {
     },
     /// Apply DDL statements from a file
     Apply {
-        #[arg(short = 'f', long, value_name = "FILE")]
+        #[arg(long, value_name = "FILE")]
         file: String,
         /// Print statements but do not execute
         #[arg(long)]
@@ -32,7 +32,7 @@ pub enum SchemaCmd {
     /// Diff a local DDL file against the live CREATE TABLE
     Diff {
         table: String,
-        #[arg(short = 'f', long, value_name = "FILE")]
+        #[arg(long, value_name = "FILE")]
         file: String,
         #[arg(short, long)]
         db: Option<String>,
@@ -112,11 +112,9 @@ pub async fn run(cmd: SchemaCmd, conn: &Connection, format: Format) -> Result<()
             println!("--- live/{}", table);
             println!("+++ local/{}", file);
             for group in diff.grouped_ops(3) {
-                for op in group {
-                    for change in diff.iter_inline_changes(&op) {
-                        let line: String = change.iter_strings_lossy()
-                            .map(|(_, s)| s.to_string())
-                            .collect();
+                for op in &group {
+                    for change in diff.iter_changes(op) {
+                        let line = change.to_string_lossy().to_string();
                         match change.tag() {
                             ChangeTag::Delete => print!("{}", format!("- {}", line).red()),
                             ChangeTag::Insert => print!("{}", format!("+ {}", line).green()),

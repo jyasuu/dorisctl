@@ -9,7 +9,7 @@ pub struct QueryArgs {
     /// SQL query string
     pub sql: Option<String>,
     /// Read query from a file
-    #[arg(short = 'f', long, value_name = "FILE")]
+    #[arg(long, value_name = "FILE")]
     pub file: Option<String>,
     /// Database to USE before running the query
     #[arg(short, long)]
